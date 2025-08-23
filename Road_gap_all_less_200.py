@@ -1,4 +1,4 @@
-# ...TCPL calculate Gap by Buffer (combined labels: ROAD_C, TRAIL_C, CART_TRACK_C)
+#...# ...TCPL calculate Gap by Buffer
 
 import arcpy, os, math
 
@@ -11,7 +11,7 @@ except:
 LAYER_NAME    = "TransportationGroundCurves"
 SUBTYPE_NAME  = "ROAD_C"
 FALLBACK_CODE = 100152
-EXTRA_CODES   = [100156, 100150]   # TRAIL_C, CART_TRACK_C
+EXTRA_CODES   = [100156, 100150]
 RADIUS_M      = 200.0
 BUF_EPS       = 0.001
 OUT_NAME      = "road_gap_less_200"
@@ -62,14 +62,12 @@ out_fc   = os.path.join(out_path, OUT_NAME)
 subtype_field = desc.subtypeFieldName or "FCSubtype"
 road_code     = resolve_subtype_code(src_fc, SUBTYPE_NAME, FALLBACK_CODE)
 
-# Combine all accepted subtype codes into one set (treated as one label)
 accepted_codes = set([road_code] + EXTRA_CODES)
 
 oid_name   = desc.OIDFieldName
 metric_sr  = pick_metric_sr(desc)
 attr_names = [f.name for f in arcpy.ListFields(src_fc) if f.type not in ("OID","Geometry","Raster")]
 
-# Read all accepted subtypes; project to metric; precompute 200 m buffers
 roads = []
 with arcpy.da.SearchCursor(src_fc, [oid_name, "SHAPE@", subtype_field] + attr_names) as cur:
     for row in cur:
@@ -88,7 +86,6 @@ with arcpy.da.SearchCursor(src_fc, [oid_name, "SHAPE@", subtype_field] + attr_na
             continue
         roads.append({"oid": soid, "geom_src": gsrc, "geom_m": gm, "buf_m": bm, "attrs": attrs})
 
-# Create / reset output using template schema
 if arcpy.Exists(out_fc):
     arcpy.Delete_management(out_fc)
 arcpy.CreateFeatureclass_management(out_path, OUT_NAME, "POLYLINE",
@@ -104,7 +101,6 @@ if not roads:
         pass
     raise SystemExit
 
-# Pairwise test over ALL lines in the combined set
 keep_mutual   = set()
 keep_onesided = set()
 
@@ -125,7 +121,6 @@ for i in range(n):
 
 final_keep = keep_mutual.union(keep_onesided)
 
-# Insert only the kept features
 if final_keep:
     insert_fields = ["SHAPE@"] + attr_names
     with arcpy.da.InsertCursor(out_fc, insert_fields) as ic:
@@ -133,7 +128,6 @@ if final_keep:
             if rec["oid"] in final_keep:
                 ic.insertRow([rec["geom_src"]] + rec["attrs"])
 
-# Add output to map
 try:
     mxd = arcpy.mapping.MapDocument("CURRENT")
     df  = arcpy.mapping.ListDataFrames(mxd)[0]
