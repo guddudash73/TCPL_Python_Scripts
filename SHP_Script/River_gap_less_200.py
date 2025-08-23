@@ -9,7 +9,7 @@ except:
 TARGET_NAMES = {"river_c", "ditch_c"}
 RADIUS_M     = 200.0
 BUF_EPS      = 0.001
-OUT_BASENAME = "road_gap_less_200"
+OUT_BASENAME = "river_gap_less_200"
 
 def _norm(s):
     s = s.lower()
