@@ -6,7 +6,7 @@ try:
 except:
     pass
 
-TARGET_NAMES = {"river_c", "ditch_c"}
+TARGET_NAMES = {"river", "ditch"}
 RADIUS_M     = 200.0
 BUF_EPS      = 0.001
 OUT_BASENAME = "river_gap_less_200"
