@@ -11,7 +11,7 @@ RADIUS_M     = 200.0
 BUF_EPS      = 0.001
 OUT_BASENAME = "river_gap_less_200"
 
-def _norm(s):
+def _norm(s): 
     s = s.lower()
     s = re.sub(r"[\s\-]+", "_", s)
     s = re.sub(r"[^a-z0-9_]", "", s)
