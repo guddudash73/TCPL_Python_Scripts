@@ -6,11 +6,13 @@ try:
 except:
     pass
 
-TARGET_NAMES   = {"river_c", "ditch_c"}
-NEAR_TOL_M     = 50.0
-VERTEX_EPS_M   = 0.2
-ENVELOPE_PAD_M = NEAR_TOL_M
-OUT_BASENAME   = "snap_50"
+TARGET_NAMES        = {"river_c", "ditch_c"}
+NEAR_TOL_M          = 50.0
+VERTEX_EPS_M        = 0.20
+SEGMENT_EPS_M       = 0.20
+PARALLEL_ANGLE_DEG  = 15.0
+ENVELOPE_PAD_M      = NEAR_TOL_M
+OUT_BASENAME        = "snap_50"
 
 def norm_name(s):
     s = s.lower()
@@ -31,15 +33,17 @@ def list_target_layers():
 def pick_metric_sr(desc):
     try:
         sr = desc.spatialReference
-        if sr and sr.type == "Projected" and "Meter" in (sr.linearUnitName or "Meter"):
-            return sr
+        if sr and sr.type == "Projected":
+            unit = (sr.linearUnitName or "").lower()
+            if ("meter" in unit) or ("metre" in unit):
+                return sr
     except:
         pass
-    ext = desc.extent
-    lon = (ext.XMin + ext.XMax)/2.0
-    lat = (ext.YMin + ext.YMax)/2.0
-    zone = int(math.floor((lon + 180.0)/6.0) + 1)
     try:
+        wgs84 = arcpy.SpatialReference(4326)
+        cen = arcpy.PointGeometry(desc.extent.centroid, desc.spatialReference).projectAs(wgs84)
+        lon, lat = cen.firstPoint.X, cen.firstPoint.Y
+        zone = int(math.floor((lon + 180.0)/6.0) + 1)
         wkid = 32600 + zone if lat >= 0 else 32700 + zone
         return arcpy.SpatialReference(wkid)
     except:
@@ -49,26 +53,83 @@ def extent_hits_point_buffer(line_ext, px, py, r):
     return not (line_ext.XMin > px + r or line_ext.XMax < px - r or
                 line_ext.YMin > py + r or line_ext.YMax < py - r)
 
+def unit_vec(dx, dy):
+    m = math.hypot(dx, dy)
+    if m == 0: return (0.0, 0.0)
+    return (dx/m, dy/m)
+
+def angle_deg(u, v):
+    ux, uy = u; vx, vy = v
+    dot = ux*vx + uy*vy
+    if dot > 1.0: dot = 1.0
+    if dot < -1.0: dot = -1.0
+    return math.degrees(math.acos(dot))
+
+def endpoints_and_dirs(geom):
+    out = []
+    for part in geom:
+        pts = [p for p in part if p]
+        n = len(pts)
+        if n >= 2:
+            dx = pts[1].X - pts[0].X
+            dy = pts[1].Y - pts[0].Y
+            out.append({"pt": pts[0], "dir": unit_vec(dx, dy)})
+            dx2 = pts[-1].X - pts[-2].X
+            dy2 = pts[-1].Y - pts[-2].Y
+            out.append({"pt": pts[-1], "dir": unit_vec(dx2, dy2)})
+    return out
+
+def neighbor_dir_at(polyline, dist_along, delta):
+    try:
+        a = max(0.0, dist_along - delta)
+        b = min(polyline.length, dist_along + delta)
+        pa = polyline.positionAlongLine(a).firstPoint
+        pb = polyline.positionAlongLine(b).firstPoint
+        return unit_vec(pb.X - pa.X, pb.Y - pa.Y)
+    except:
+        return (0.0, 0.0)
+
+def project_point_on_line(point_geom, polyline):
+    try:
+        qp, dalong, dfrom, _right = polyline.queryPointAndDistance(point_geom)
+        return (qp, dalong, dfrom)
+    except:
+        dfrom = point_geom.distanceTo(polyline)
+        return (None, None, dfrom)
+
 layers = list_target_layers()
 first_desc = arcpy.Describe(layers[0])
 src_sr     = first_desc.spatialReference
 out_path   = first_desc.path if getattr(first_desc, "path", None) else os.path.dirname(first_desc.catalogPath)
-is_gdb     = out_path.lower().endswith(".gdb")
+is_gdb     = (out_path or "").lower().endswith(".gdb")
 out_name   = OUT_BASENAME if is_gdb else OUT_BASENAME + ".shp"
 out_fc     = os.path.join(out_path, out_name)
 metric_sr  = pick_metric_sr(first_desc)
 
 features = []
-for lyr in layers:
+for lid, lyr in enumerate(layers):
     d = arcpy.Describe(lyr)
     oid_name = d.OIDFieldName
     with arcpy.da.SearchCursor(lyr, [oid_name, "SHAPE@"]) as cur:
         for oid, gsrc in cur:
+            if gsrc is None:
+                continue
             try:
-                gm = gsrc.projectAs(metric_sr) if d.spatialReference and d.spatialReference.name != metric_sr.name else gsrc
+                same_sr = (d.spatialReference and metric_sr and
+                           getattr(d.spatialReference, "factoryCode", None) == getattr(metric_sr, "factoryCode", None))
+                gm = gsrc if same_sr else gsrc.projectAs(metric_sr)
             except:
-                gm = gsrc
-            features.append({"oid": int(oid), "geom_src": gsrc, "geom_m": gm, "ext": gm.extent})
+                continue
+            if gm is None or gm.pointCount < 2:
+                continue
+            features.append({
+                "lid": lid,
+                "oid": int(oid),
+                "geom_src": gsrc,
+                "geom_m": gm,
+                "ext": gm.extent,
+                "endpoints": endpoints_and_dirs(gm)
+            })
 
 if arcpy.Exists(out_fc):
     arcpy.Delete_management(out_fc)
@@ -88,54 +149,75 @@ flagged = set()
 
 for rec in features:
     gi = rec["geom_m"]
-    if gi is None or gi.pointCount < 2:
+    eplist = rec["endpoints"]
+    if not eplist:
         continue
-    p_start = gi.firstPoint
-    p_end   = gi.lastPoint
-    should_flag_this_feature = False
-    for (px, py) in ((p_start.X, p_start.Y), (p_end.X, p_end.Y)):
+
+    should_flag_line = False
+
+    for ep in eplist:
+        ep_pt = ep["pt"]
+        ep_dir = ep["dir"]
+        if ep_dir == (0.0, 0.0):
+            continue
+
+        px, py = ep_pt.X, ep_pt.Y
         pt = arcpy.PointGeometry(arcpy.Point(px, py), metric_sr)
-        snapped_any_neighbor = False
-        near_any_neighbor = False
+
         for other in features:
-            if other["oid"] == rec["oid"]:
+            if other["lid"] == rec["lid"] and other["oid"] == rec["oid"]:
                 continue
             if not extent_hits_point_buffer(other["ext"], px, py, ENVELOPE_PAD_M):
                 continue
+
             gj = other["geom_m"]
+
             try:
-                d = pt.distanceTo(gj)
+                d_line = pt.distanceTo(gj)
             except:
                 continue
-            if d <= NEAR_TOL_M:
-                near_any_neighbor = True
-                snapped_here = False
-                for part in gj:
-                    for v in part:
-                        if v is None:
-                            continue
-                        try:
-                            dv = arcpy.PointGeometry(v, metric_sr).distanceTo(pt)
-                        except:
-                            continue
-                        if dv <= VERTEX_EPS_M:
-                            snapped_here = True
+            if d_line > NEAR_TOL_M:
+                continue
+
+            snapped_to_vertex = False
+            for part in gj:
+                for v in part:
+                    if v is None: continue
+                    try:
+                        if arcpy.PointGeometry(v, metric_sr).distanceTo(pt) <= VERTEX_EPS_M:
+                            snapped_to_vertex = True
                             break
-                    if snapped_here:
-                        break
-                if snapped_here:
-                    snapped_any_neighbor = True
+                    except:
+                        continue
+                if snapped_to_vertex:
                     break
-        if not snapped_any_neighbor and near_any_neighbor:
-            should_flag_this_feature = True
+            if snapped_to_vertex:
+                continue
+
+            qp, dalong, dperp = project_point_on_line(pt, gj)
+            if dperp is not None and dperp <= SEGMENT_EPS_M:
+                should_flag_line = True
+                break
+            if qp is not None and dalong is not None:
+                delta = min(1.0, 0.1 * NEAR_TOL_M)
+                n_dir = neighbor_dir_at(gj, dalong, delta)
+                ang = angle_deg(ep_dir, n_dir)
+                if (ang <= PARALLEL_ANGLE_DEG) or (abs(180.0 - ang) <= PARALLEL_ANGLE_DEG):
+                    continue
+                else:
+                    should_flag_line = True
+                    break
+
+        if should_flag_line:
             break
-    if should_flag_this_feature:
-        flagged.add(rec["oid"])
+
+    if should_flag_line:
+        flagged.add((rec["lid"], rec["oid"]))
 
 if flagged:
     with arcpy.da.InsertCursor(out_fc, ["SHAPE@"]) as ic:
         for rec in features:
-            if rec["oid"] in flagged:
+            if (rec["lid"], rec["oid"]) in flagged:
                 ic.insertRow([rec["geom_src"]])
 
 try:
@@ -149,5 +231,5 @@ except:
 print "Output:", out_fc
 print "Matched layers:", ", ".join([lyr.name for lyr in layers])
 print "Features scanned:", len(features)
-print "Lines flagged (endpoint near <= %.1f m and NOT snapped to ANY vertex): %d" % (NEAR_TOL_M, len(flagged))
+print "Dangle errors flagged:", len(flagged)
 print "Done."
