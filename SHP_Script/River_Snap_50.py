@@ -6,7 +6,7 @@ try:
 except:
     pass
 
-TARGET_NAMES   = {"road_c", "trail_c", "cart_track"}
+TARGET_NAMES   = {"river_c", "ditch_c"}
 NEAR_TOL_M     = 50.0
 VERTEX_EPS_M   = 0.2
 ENVELOPE_PAD_M = NEAR_TOL_M

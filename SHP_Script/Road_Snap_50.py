@@ -6,7 +6,7 @@ try:
 except:
     pass
 
-TARGET_NAMES   = {"road_c", "trail_c", "cart_track"}  # case-insensitive layer names
+TARGET_NAMES   = {"road_c", "trail_c", "cart_track"}
 NEAR_TOL_M     = 50.0
 VERTEX_EPS_M   = 0.2
 ENVELOPE_PAD_M = NEAR_TOL_M
@@ -58,14 +58,14 @@ out_name   = OUT_BASENAME if is_gdb else OUT_BASENAME + ".shp"
 out_fc     = os.path.join(out_path, out_name)
 metric_sr  = pick_metric_sr(first_desc)
 
-features = []   # [{oid, geom_src, geom_m, ext}]
+features = []
 for lyr in layers:
     d = arcpy.Describe(lyr)
     oid_name = d.OIDFieldName
     with arcpy.da.SearchCursor(lyr, [oid_name, "SHAPE@"]) as cur:
         for oid, gsrc in cur:
             try:
-                gm = gsrc.projectAs(metric_sr) if d.spatialReference.name != metric_sr.name else gsrc
+                gm = gsrc.projectAs(metric_sr) if d.spatialReference and d.spatialReference.name != metric_sr.name else gsrc
             except:
                 gm = gsrc
             features.append({"oid": int(oid), "geom_src": gsrc, "geom_m": gm, "ext": gm.extent})
@@ -86,28 +86,30 @@ if not features:
 
 flagged = set()
 
-for i, fi in enumerate(features):
-    gi = fi["geom_m"]
+for rec in features:
+    gi = rec["geom_m"]
     if gi is None or gi.pointCount < 2:
         continue
     p_start = gi.firstPoint
     p_end   = gi.lastPoint
+    should_flag_this_feature = False
     for (px, py) in ((p_start.X, p_start.Y), (p_end.X, p_end.Y)):
-        near_any = False
-        snapped_to_vertex = False
         pt = arcpy.PointGeometry(arcpy.Point(px, py), metric_sr)
-        for j, fj in enumerate(features):
-            if fj["oid"] == fi["oid"]:
+        snapped_any_neighbor = False
+        near_any_neighbor = False
+        for other in features:
+            if other["oid"] == rec["oid"]:
                 continue
-            if not extent_hits_point_buffer(fj["ext"], px, py, ENVELOPE_PAD_M):
+            if not extent_hits_point_buffer(other["ext"], px, py, ENVELOPE_PAD_M):
                 continue
-            gj = fj["geom_m"]
+            gj = other["geom_m"]
             try:
                 d = pt.distanceTo(gj)
             except:
                 continue
             if d <= NEAR_TOL_M:
-                near_any = True
+                near_any_neighbor = True
+                snapped_here = False
                 for part in gj:
                     for v in part:
                         if v is None:
@@ -117,14 +119,18 @@ for i, fi in enumerate(features):
                         except:
                             continue
                         if dv <= VERTEX_EPS_M:
-                            snapped_to_vertex = True
+                            snapped_here = True
                             break
-                    if snapped_to_vertex:
+                    if snapped_here:
                         break
-                if near_any and not snapped_to_vertex:
+                if snapped_here:
+                    snapped_any_neighbor = True
                     break
-        if near_any and not snapped_to_vertex:
-            flagged.add(fi["oid"])
+        if not snapped_any_neighbor and near_any_neighbor:
+            should_flag_this_feature = True
+            break
+    if should_flag_this_feature:
+        flagged.add(rec["oid"])
 
 if flagged:
     with arcpy.da.InsertCursor(out_fc, ["SHAPE@"]) as ic:
@@ -143,5 +149,5 @@ except:
 print "Output:", out_fc
 print "Matched layers:", ", ".join([lyr.name for lyr in layers])
 print "Features scanned:", len(features)
-print "Lines flagged (endpoint near <= %.1f m but not snapped to a vertex): %d" % (NEAR_TOL_M, len(flagged))
+print "Lines flagged (endpoint near <= %.1f m and NOT snapped to ANY vertex): %d" % (NEAR_TOL_M, len(flagged))
 print "Done."
