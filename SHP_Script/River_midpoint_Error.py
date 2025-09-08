@@ -11,7 +11,7 @@ RADIUS_M     = 200.0
 BUF_EPS      = 0.001
 OUT_BASENAME = "river_gap_less_200"
 
-def _norm(s): 
+def _norm(s):
     s = s.lower()
     s = re.sub(r"[\s\-]+", "_", s)
     s = re.sub(r"[^a-z0-9_]", "", s)
@@ -44,13 +44,15 @@ def _metric_sr(desc):
     except:
         return arcpy.SpatialReference(3857)
 
-layers = _find_layers()
+layers     = _find_layers()
 first_desc = arcpy.Describe(layers[0])
 src_sr     = first_desc.spatialReference
 out_path   = first_desc.path if getattr(first_desc, "path", None) else os.path.dirname(first_desc.catalogPath)
 is_gdb     = out_path.lower().endswith(".gdb")
-out_name   = OUT_BASENAME if is_gdb else OUT_BASENAME + ".shp"
-out_fc     = os.path.join(out_path, out_name)
+out_name_l = OUT_BASENAME if is_gdb else OUT_BASENAME + ".shp"
+out_name_p = OUT_BASENAME + "_midpts" if is_gdb else OUT_BASENAME + "_midpts.shp"
+out_fc_l   = os.path.join(out_path, out_name_l)
+out_fc_p   = os.path.join(out_path, out_name_p)
 metric_sr  = _metric_sr(first_desc)
 
 features = []
@@ -64,60 +66,77 @@ for lyr in layers:
             except:
                 gm = gsrc
             try:
-                bm = gm.buffer(RADIUS_M + BUF_EPS)
+                length_m = gm.length
+                mid_m = gm.positionAlongLine(length_m/2.0, False)
             except:
                 continue
-            features.append({"oid": int(oid), "geom_src": gsrc, "geom_m": gm, "buf_m": bm})
+            features.append({"oid": int(oid), "geom_src": gsrc, "geom_m": gm, "mid_m": mid_m})
 
-if arcpy.Exists(out_fc):
-    arcpy.Delete_management(out_fc)
-arcpy.CreateFeatureclass_management(out_path, out_name, "POLYLINE", None, "DISABLED", "DISABLED", src_sr)
+for fc in [out_fc_l, out_fc_p]:
+    if arcpy.Exists(fc):
+        arcpy.Delete_management(fc)
+
+arcpy.CreateFeatureclass_management(out_path, out_name_l, "POLYLINE", None, "DISABLED", "DISABLED", src_sr)
+arcpy.CreateFeatureclass_management(out_path, out_name_p, "POINT",    None, "DISABLED", "DISABLED", src_sr)
 
 if not features:
     try:
         mxd = arcpy.mapping.MapDocument("CURRENT")
         df  = arcpy.mapping.ListDataFrames(mxd)[0]
-        arcpy.mapping.AddLayer(df, arcpy.mapping.Layer(out_fc), "TOP")
+        arcpy.mapping.AddLayer(df, arcpy.mapping.Layer(out_fc_l), "TOP")
+        arcpy.mapping.AddLayer(df, arcpy.mapping.Layer(out_fc_p), "TOP")
         arcpy.RefreshTOC(); arcpy.RefreshActiveView()
     except:
         pass
     raise SystemExit
 
-keep_mutual, keep_onesided = set(), set()
+keep_set = set()
 n = len(features)
 for i in range(n):
-    gi = features[i]["geom_m"]; bi = features[i]["buf_m"]; oi = features[i]["oid"]
-    for j in range(i+1, n):
-        gj = features[j]["geom_m"]; bj = features[j]["buf_m"]; oj = features[j]["oid"]
+    gi = features[i]["geom_m"]
+    mi = features[i]["mid_m"]
+    oi = features[i]["oid"]
+    hit = False
+    for j in range(n):
+        if i == j:
+            continue
+        gj = features[j]["geom_m"]
         try:
-            a_in_b = gi.within(bj)
-            b_in_a = gj.within(bi)
+            dist = gj.distanceTo(mi)
         except:
             continue
-        if a_in_b and b_in_a:
-            keep_mutual.add(oi); keep_mutual.add(oj)
-        elif a_in_b or b_in_a:
-            keep_onesided.add(oi if a_in_b else oj)
+        if dist <= RADIUS_M + BUF_EPS:
+            hit = True
+            break
+    if hit:
+        keep_set.add(oi)
 
-final_keep = keep_mutual.union(keep_onesided)
-
-if final_keep:
-    with arcpy.da.InsertCursor(out_fc, ["SHAPE@"]) as ic:
+if keep_set:
+    with arcpy.da.InsertCursor(out_fc_l, ["SHAPE@"]) as ic:
         for rec in features:
-            if rec["oid"] in final_keep:
+            if rec["oid"] in keep_set:
                 ic.insertRow([rec["geom_src"]])
+
+with arcpy.da.InsertCursor(out_fc_p, ["SHAPE@"]) as ip:
+    for rec in features:
+        try:
+            mid_src = rec["mid_m"].projectAs(src_sr) if metric_sr.name != src_sr.name else rec["mid_m"]
+        except:
+            mid_src = rec["mid_m"]
+        ip.insertRow([mid_src])
 
 try:
     mxd = arcpy.mapping.MapDocument("CURRENT")
     df  = arcpy.mapping.ListDataFrames(mxd)[0]
-    arcpy.mapping.AddLayer(df, arcpy.mapping.Layer(out_fc), "TOP")
+    arcpy.mapping.AddLayer(df, arcpy.mapping.Layer(out_fc_l), "TOP")
+    arcpy.mapping.AddLayer(df, arcpy.mapping.Layer(out_fc_p), "TOP")
     arcpy.RefreshTOC(); arcpy.RefreshActiveView()
 except:
     pass
 
-print "Output:", out_fc
+print "Output lines:", out_fc_l
+print "Output midpoints:", out_fc_p
 print "Matched layers:", ", ".join([lyr.name for lyr in layers])
 print "Features read:", len(features)
-print "Kept (mutual):", len(keep_mutual), " | Kept (one-sided):", len(keep_onesided)
-print "Final kept (union):", len(final_keep)
+print "Kept (midpoint <= %sm):" % RADIUS_M, len(keep_set)
 print "Done."
